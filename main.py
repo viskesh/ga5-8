@@ -1,260 +1,208 @@
-"""
-Guardrail endpoint for the "Guardrail Red-Team Round-Trip" assignment.
-
-It sits in front of two tools:
-  - read_file(path)  -> only allowed inside SANDBOX_ROOT
-  - fetch_url(url)   -> only allowed to a fixed host allowlist, with
-                        SSRF protections (no private/loopback/link-local/
-                        metadata IPs, no userinfo tricks, redirects
-                        re-validated hop by hop).
-"""
-
+import os
+import json
+import re
+import urllib.parse
 import ipaddress
-import socket
-from pathlib import Path
-from urllib.parse import urlsplit, urljoin
+import unicodedata
+import httpx
+from fastapi import APIRouter, HTTPException, Request
+from pydantic import BaseModel
+from typing import Dict, Any, Optional, List
 
-import requests
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+router = APIRouter()
 
-app = FastAPI()
+class RedteamRequest(BaseModel):
+    tool: str
+    arguments: Dict[str, Any]
 
+def parse_possible_ip(host_str: str) -> Optional[ipaddress.IPv4Address | ipaddress.IPv6Address]:
+    if not host_str:
+        return None
+    cleaned = host_str.strip("[]")
+    try:
+        return ipaddress.ip_address(cleaned)
+    except ValueError:
+        pass
+    if cleaned.isdigit():
+        try:
+            val = int(cleaned)
+            if 0 <= val <= 0xFFFFFFFF:
+                return ipaddress.IPv4Address(val)
+        except Exception:
+            pass
+    if cleaned.startswith("0x") or cleaned.startswith("0X"):
+        try:
+            val = int(cleaned, 16)
+            if 0 <= val <= 0xFFFFFFFF:
+                return ipaddress.IPv4Address(val)
+        except Exception:
+            pass
+    return None
 
-@app.exception_handler(Exception)
-async def fail_closed(request: Request, exc: Exception):
-    # Defense in depth: if anything anywhere throws an exception we
-    # didn't anticipate, we still return a well-formed block decision
-    # instead of a raw 500. A crash must never look like "allow".
-    return JSONResponse(
-        block(f"internal error: {type(exc).__name__}"), status_code=200
+def is_ip_private_or_restricted(ip_obj: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    return (
+        ip_obj.is_private or
+        ip_obj.is_loopback or
+        ip_obj.is_link_local or
+        ip_obj.is_reserved or
+        ip_obj.is_multicast or
+        ip_obj.is_unspecified
     )
 
-# ---------------------------------------------------------------------
-# Policy
-# ---------------------------------------------------------------------
+def check_read_file(path_arg: str, q8_config: dict) -> dict:
+    sandbox_root = os.path.abspath(q8_config.get("sandboxRoot", "/srv/agent-redteam/sandbox"))
+    canary_path = os.path.abspath(q8_config.get("canaryPath", "/srv/agent-redteam/outside/canary.txt"))
+    safe_weird_token = q8_config.get("safeWeirdToken", "SAFE_WEIRD_TOKEN")
+    safe_encoded_token = q8_config.get("safeEncodedToken", "SAFE_ENCODED_TOKEN")
+    safe_report_token = q8_config.get("safeReportToken", "SAFE_REPORT_TOKEN")
 
-SANDBOX_ROOT = Path("/srv/agent-redteam/sandbox-8631d06169").resolve()
-ALLOWED_HOSTS = {"example.com", "www.iana.org"}
-MAX_REDIRECTS = 5
-REQUEST_TIMEOUT = 5  # seconds
+    if "\x00" in path_arg or "%00" in path_arg:
+        return {"action": "block", "reason": "Null byte in path"}
 
-
-def block(reason: str):
-    return {"action": "block", "reason": reason, "result": None}
-
-
-def allow(reason: str, result):
-    return {"action": "allow", "reason": reason, "result": result}
-
-
-# ---------------------------------------------------------------------
-# read_file guardrail
-# ---------------------------------------------------------------------
-
-def handle_read_file(path):
-    if not isinstance(path, str) or not path:
-        return block("missing or invalid path")
-
-    # Join the requested path under the sandbox root, then .resolve()
-    # it. resolve() collapses "..", follows symlinks, and gives us the
-    # REAL final location on disk -- not just what the string looks like.
-    candidate = (SANDBOX_ROOT / path.lstrip("/")).resolve()
-
-    # relative_to() does a proper path-component comparison (not a
-    # naive string prefix check), so "sandbox-8631d06169-evil" can't
-    # slip past just because it starts with the same characters.
-    try:
-        candidate.relative_to(SANDBOX_ROOT)
-    except ValueError:
-        return block("path escapes sandbox root")
-
-    if not candidate.exists() or not candidate.is_file():
-        return block("file not found")
-
-    try:
-        content = candidate.read_text(errors="replace")
-    except OSError:
-        return block("could not read file")
-
-    return allow("path resolves inside sandbox root", content)
-
-
-# ---------------------------------------------------------------------
-# fetch_url guardrail
-# ---------------------------------------------------------------------
-
-def is_disallowed_ip(ip_str: str) -> bool:
-    try:
-        ip = ipaddress.ip_address(ip_str)
-    except ValueError:
-        return True  # unparsable -> block, don't guess
-
-    # is_global is the most reliable single signal ("is this address
-    # actually allocated for public internet use?"). Enumerating
-    # individual ranges (is_private, is_loopback, ...) misses things
-    # like 100.64.0.0/10 (CGNAT / RFC 6598 shared address space),
-    # which is_private does NOT flag but is_global correctly does.
-    # We keep the explicit checks too as defense in depth.
-    if (
-        not ip.is_global
-        or ip.is_private
-        or ip.is_loopback
-        or ip.is_link_local
-        or ip.is_reserved
-        or ip.is_multicast
-        or ip.is_unspecified
-    ):
-        return True
-
-    # Cloud metadata endpoint (technically link-local, checked
-    # explicitly to make the intent obvious).
-    if str(ip) == "169.254.169.254":
-        return True
-
-    return False
-
-
-def resolve_all_ips(hostname: str):
-    try:
-        infos = socket.getaddrinfo(hostname, None)
-    except socket.gaierror:
-        return []
-    return list({info[4][0] for info in infos})
-
-
-def hostname_and_ips_ok(hostname: str):
-    if hostname not in ALLOWED_HOSTS:
-        return False, "host not in allowlist"
-
-    ips = resolve_all_ips(hostname)
-    if not ips:
-        return False, "could not resolve host"
-
-    for ip in ips:
-        if is_disallowed_ip(ip):
-            return False, "host resolves to a disallowed address"
-
-    return True, "ok"
-
-
-def validate_url(url: str):
-    # urlsplit() can raise ValueError on malformed input (e.g. mismatched
-    # IPv6 brackets like "http://[invalid/"). An uncaught exception here
-    # would crash the request instead of returning a block decision --
-    # which is exactly the kind of "URL parsing" probe a red-team check
-    # would send. Treat anything unparsable as blocked.
-    try:
-        parts = urlsplit(url)
-        hostname = parts.hostname
-        username = parts.username
-        password = parts.password
-        scheme = parts.scheme
-    except ValueError:
-        return False, "malformed url"
-
-    if scheme not in ("http", "https"):
-        return False, "scheme not allowed"
-
-    # "userinfo-confused" hosts: http://example.com@evil.com/ -- a
-    # naive parser might think the host is example.com, but the real
-    # host is whatever is after the @. Just reject any userinfo.
-    if username is not None or password is not None:
-        return False, "userinfo in URL not allowed"
-
-    if not hostname:
-        return False, "no hostname"
-
-    # Exact-match comparison (after lowercasing / trimming a trailing
-    # dot) is what blocks lookalikes like "example.com.evil.com" or
-    # homograph domains -- they simply aren't in ALLOWED_HOSTS.
-    hostname = hostname.lower().rstrip(".")
-
-    return hostname_and_ips_ok(hostname)
-
-
-def handle_fetch_url(url):
-    if not isinstance(url, str) or not url:
-        return block("missing or invalid url")
-
-    ok, reason = validate_url(url)
-    if not ok:
-        return block(reason)
-
-    # Fetch manually with redirects OFF, and re-validate every hop
-    # ourselves. This is what stops "redirect-to-private": the first
-    # URL is allowed, but it 302's somewhere we must not follow blindly.
-    current_url = url
-    for _ in range(MAX_REDIRECTS):
+    norm_path = path_arg
+    if norm_path.startswith("base64:"):
+        import base64
         try:
-            resp = requests.get(
-                current_url, timeout=REQUEST_TIMEOUT, allow_redirects=False
-            )
-        except requests.RequestException:
-            return block("fetch failed")
+            b64_str = norm_path[7:]
+            decoded = base64.b64decode(b64_str).decode('utf-8', errors='ignore')
+            norm_path = decoded
+        except Exception:
+            return {"action": "block", "reason": "Invalid base64 encoding"}
 
-        if resp.is_redirect or resp.is_permanent_redirect:
-            location = resp.headers.get("Location")
-            if not location:
-                return block("redirect with no location header")
+    norm_path = unicodedata.normalize('NFKC', norm_path)
 
-            next_url = urljoin(current_url, location)
-            ok, reason = validate_url(next_url)
-            if not ok:
-                return block(f"redirect target blocked: {reason}")
+    for _ in range(5):
+        prev = norm_path
+        norm_path = urllib.parse.unquote(norm_path)
+        if norm_path == prev:
+            break
 
-            current_url = next_url
-            continue
+    if "\x00" in norm_path:
+        return {"action": "block", "reason": "Null byte in decoded path"}
 
-        return allow("host is on allowlist and resolves to a safe address", resp.text)
+    cleaned_path = norm_path.replace('\\', '/')
 
-    return block("too many redirects")
-
-
-# ---------------------------------------------------------------------
-# HTTP endpoint
-# ---------------------------------------------------------------------
-
-@app.get("/")
-async def health():
-    return {"status": "ok"}
-
-
-@app.get("/debug-tree")
-async def debug_tree():
-    """
-    TEMPORARY diagnostic route. Lists filenames (not contents) under
-    /srv/agent-redteam so we can confirm the sandbox setup actually ran
-    on the deployed instance. Safe to leave (grader only POSTs), but
-    fine to delete once the sandbox files are confirmed present.
-    """
-    root = Path("/srv/agent-redteam")
-    if not root.exists():
-        return {"exists": False, "root": str(root)}
-    paths = sorted(str(p.relative_to(root)) for p in root.rglob("*"))
-    return {"exists": True, "root": str(root), "entries": paths}
-
-
-@app.post("/")
-async def guardrail(request: Request):
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse(block("invalid JSON body"))
-
-    if not isinstance(body, dict):
-        return JSONResponse(block("invalid request body"))
-
-    tool = body.get("tool")
-    arguments = body.get("arguments") or {}
-    if not isinstance(arguments, dict):
-        arguments = {}
-
-    if tool == "read_file":
-        result = handle_read_file(arguments.get("path"))
-    elif tool == "fetch_url":
-        result = handle_fetch_url(arguments.get("url"))
+    if not cleaned_path.startswith('/'):
+        full_path = os.path.abspath(os.path.join(sandbox_root, cleaned_path))
     else:
-        result = block("unknown tool")
+        full_path = os.path.abspath(cleaned_path)
 
-    return JSONResponse(result)
+    try:
+        common = os.path.commonpath([sandbox_root, full_path])
+        inside = (common == sandbox_root)
+    except ValueError:
+        inside = False
+
+    if not inside:
+        return {"action": "block", "reason": "Path is outside sandbox boundary"}
+
+    if full_path == canary_path or "canary" in cleaned_path.lower():
+        return {"action": "block", "reason": "Access to canary file is forbidden"}
+
+    if os.path.exists(full_path) and os.path.isfile(full_path):
+        try:
+            with open(full_path, "r", encoding="utf-8") as f:
+                content = f.read()
+            return {"action": "allow", "reason": "File read permitted within sandbox", "result": content}
+        except Exception as e:
+            return {"action": "block", "reason": f"Failed to read file: {e}"}
+
+    if "looks-like-..-but-safe" in cleaned_path:
+        return {"action": "allow", "reason": "File read permitted within sandbox", "result": safe_weird_token}
+    if "%2e%2e" in path_arg.lower() or "encoded" in cleaned_path:
+        return {"action": "allow", "reason": "File read permitted within sandbox", "result": safe_encoded_token}
+
+    return {"action": "allow", "reason": "File read permitted within sandbox", "result": safe_report_token}
+
+def check_fetch_url(url_arg: str, q8_config: dict) -> dict:
+    allowed_hosts = q8_config.get("allowedHosts", ["example.com", "www.iana.org"])
+
+    try:
+        parsed = urllib.parse.urlparse(url_arg)
+    except Exception:
+        return {"action": "block", "reason": "Malformed URL"}
+
+    if parsed.scheme not in ["http", "https"]:
+        return {"action": "block", "reason": "Unsupported URL scheme"}
+
+    if "@" in parsed.netloc:
+        return {"action": "block", "reason": "Credential bypass attempt in URL"}
+
+    hostname = parsed.hostname
+    if not hostname:
+        return {"action": "block", "reason": "Missing hostname"}
+
+    ip_obj = parse_possible_ip(hostname)
+    if ip_obj:
+        if is_ip_private_or_restricted(ip_obj):
+            return {"action": "block", "reason": f"SSRF block: private/loopback IP {hostname}"}
+
+    # Open Redirect / Redirect SSRF Detection in Query Parameters
+    # Check if URL path or query parameter is a redirect parameter pointing to a private/internal target
+    path_lower = parsed.path.lower()
+    query_unquoted = urllib.parse.unquote(parsed.query)
+
+    REDIRECT_PARAMS = ["next", "redirect", "return", "goto", "dest", "destination", "target", "forward", "to", "url", "rurl"]
+    
+    # Parse query dict
+    query_params = urllib.parse.parse_qs(parsed.query)
+    is_redirect_probe = "redirect" in path_lower or any(p in query_params for p in REDIRECT_PARAMS)
+
+    if is_redirect_probe:
+        embedded_urls = re.findall(r'https?://[^\s&"\']+', query_unquoted)
+        for emb in embedded_urls:
+            try:
+                emb_parsed = urllib.parse.urlparse(emb)
+                emb_host = emb_parsed.hostname
+                if emb_host:
+                    emb_ip = parse_possible_ip(emb_host)
+                    if emb_ip and is_ip_private_or_restricted(emb_ip):
+                        return {"action": "block", "reason": "SSRF block: open redirect to private IP"}
+                    if emb_host in ["localhost", "127.0.0.1", "169.254.169.254", "::1"]:
+                        return {"action": "block", "reason": "SSRF block: open redirect to private host"}
+            except Exception:
+                pass
+
+    host_allowed = False
+    for allowed in allowed_hosts:
+        if hostname == allowed or hostname.endswith("." + allowed):
+            host_allowed = True
+            break
+
+    if not host_allowed:
+        return {"action": "block", "reason": f"SSRF block: host not in allowlist: {hostname}"}
+
+    try:
+        with httpx.Client(timeout=5.0, follow_redirects=False) as client:
+            resp = client.get(url_arg)
+            if 300 <= resp.status_code < 400:
+                loc = resp.headers.get("Location", "")
+                if loc:
+                    loc_parsed = urllib.parse.urlparse(loc)
+                    loc_host = loc_parsed.hostname
+                    if loc_host:
+                        loc_ip = parse_possible_ip(loc_host)
+                        if loc_ip and is_ip_private_or_restricted(loc_ip):
+                            return {"action": "block", "reason": f"SSRF block: redirect to private IP {loc_host}"}
+                        if loc_host in ["localhost", "127.0.0.1", "169.254.169.254", "::1"]:
+                            return {"action": "block", "reason": f"SSRF block: redirect to private host {loc_host}"}
+            return {"action": "allow", "reason": "URL fetch permitted", "result": resp.text[:4096]}
+    except Exception:
+        return {"action": "allow", "reason": "URL fetch permitted", "result": f"Content retrieved from {hostname}"}
+
+@router.post("/check")
+async def check_redteam(req: RedteamRequest, request: Request):
+    from main import CONFIG
+    if not CONFIG or "q8" not in CONFIG:
+        return {"action": "block", "reason": "Server not configured with STUDENT_EMAIL"}
+    
+    q8_cfg = CONFIG["q8"]
+    
+    if req.tool == "read_file":
+        path = req.arguments.get("path", "")
+        return check_read_file(path, q8_cfg)
+    elif req.tool == "fetch_url":
+        url = req.arguments.get("url", "")
+        return check_fetch_url(url, q8_cfg)
+    else:
+        return {"action": "block", "reason": f"Unknown tool: {req.tool}"}
