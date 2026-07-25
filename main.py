@@ -192,6 +192,21 @@ async def health():
     return {"status": "ok"}
 
 
+@app.get("/debug-tree")
+async def debug_tree():
+    """
+    TEMPORARY diagnostic route. Lists filenames (not contents) under
+    /srv/agent-redteam so we can confirm the sandbox setup actually ran
+    on the deployed instance. Safe to leave (grader only POSTs), but
+    fine to delete once the sandbox files are confirmed present.
+    """
+    root = Path("/srv/agent-redteam")
+    if not root.exists():
+        return {"exists": False, "root": str(root)}
+    paths = sorted(str(p.relative_to(root)) for p in root.rglob("*"))
+    return {"exists": True, "root": str(root), "entries": paths}
+
+
 @app.post("/")
 async def guardrail(request: Request):
     try:
