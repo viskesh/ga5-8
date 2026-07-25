@@ -80,8 +80,15 @@ def is_disallowed_ip(ip_str: str) -> bool:
     except ValueError:
         return True  # unparsable -> block, don't guess
 
+    # is_global is the most reliable single signal ("is this address
+    # actually allocated for public internet use?"). Enumerating
+    # individual ranges (is_private, is_loopback, ...) misses things
+    # like 100.64.0.0/10 (CGNAT / RFC 6598 shared address space),
+    # which is_private does NOT flag but is_global correctly does.
+    # We keep the explicit checks too as defense in depth.
     if (
-        ip.is_private
+        not ip.is_global
+        or ip.is_private
         or ip.is_loopback
         or ip.is_link_local
         or ip.is_reserved
