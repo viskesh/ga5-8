@@ -20,6 +20,16 @@ from fastapi.responses import JSONResponse
 
 app = FastAPI()
 
+
+@app.exception_handler(Exception)
+async def fail_closed(request: Request, exc: Exception):
+    # Defense in depth: if anything anywhere throws an exception we
+    # didn't anticipate, we still return a well-formed block decision
+    # instead of a raw 500. A crash must never look like "allow".
+    return JSONResponse(
+        block(f"internal error: {type(exc).__name__}"), status_code=200
+    )
+
 # ---------------------------------------------------------------------
 # Policy
 # ---------------------------------------------------------------------
@@ -129,18 +139,29 @@ def hostname_and_ips_ok(hostname: str):
 
 
 def validate_url(url: str):
-    parts = urlsplit(url)
+    # urlsplit() can raise ValueError on malformed input (e.g. mismatched
+    # IPv6 brackets like "http://[invalid/"). An uncaught exception here
+    # would crash the request instead of returning a block decision --
+    # which is exactly the kind of "URL parsing" probe a red-team check
+    # would send. Treat anything unparsable as blocked.
+    try:
+        parts = urlsplit(url)
+        hostname = parts.hostname
+        username = parts.username
+        password = parts.password
+        scheme = parts.scheme
+    except ValueError:
+        return False, "malformed url"
 
-    if parts.scheme not in ("http", "https"):
+    if scheme not in ("http", "https"):
         return False, "scheme not allowed"
 
     # "userinfo-confused" hosts: http://example.com@evil.com/ -- a
     # naive parser might think the host is example.com, but the real
     # host is whatever is after the @. Just reject any userinfo.
-    if parts.username is not None or parts.password is not None:
+    if username is not None or password is not None:
         return False, "userinfo in URL not allowed"
 
-    hostname = parts.hostname
     if not hostname:
         return False, "no hostname"
 
